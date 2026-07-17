@@ -32,10 +32,13 @@ Telegram открывает миниаппы только по **HTTPS**, а wis
 ```
 Telegram Menu Button
    ↓
-https://<app>.onrender.com          ← HTTPS-фронт, Render free tier (proxy/server.js)
+https://stavkiblin.onrender.com      ← HTTPS-фронт, Render free tier (proxy/server.js)
    ↓ прозрачный прокси
-http://stavkiblin.duckdns.org:<порт> ← бэк на wispbyte free (этот server.js)
+http://stavkiblin.duckdns.org:12745  ← бэк на wispbyte free (этот server.js)
 ```
+
+**Конкретные значения (июль 2026):** wispbyte-нода `FREE-EU-RO-36`, адрес `78.154.103.41:12745`,
+DuckDNS-домен `stavkiblin` → A-запись на `78.154.103.41`.
 
 `*.onrender.com` не в блок-листах AdGuard/anti-phishing (в отличие от `*.workers.dev` —
 проверено на прошлой миниаппке).
@@ -47,7 +50,7 @@ http://stavkiblin.duckdns.org:<порт> ← бэк на wispbyte free (этот
 2. **DuckDNS**: поддомен `stavkiblin` → A-запись на IP wispbyte-ноды
    (не привязываемся к автогенерённому хостнейму wispbyte — он может меняться).
 3. **Render**: New Web Service из этого же репо, Start Command `node proxy/server.js`,
-   env `BACKEND_URL=http://stavkiblin.duckdns.org:<порт>`.
+   env `BACKEND_URL=http://stavkiblin.duckdns.org:12745`.
 4. Кнопку меню бот ставит сам при старте из `WEBAPP_URL`.
 5. Render free засыпает после 15 мин простоя — бэк сам пингует
    `WEBAPP_URL/proxy-health` каждые 14 минут (см. конец server.js).
