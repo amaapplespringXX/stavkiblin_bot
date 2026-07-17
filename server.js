@@ -22,6 +22,10 @@ const express = require('express');
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const ADMIN_USERNAMES = (process.env.ADMIN_USERNAMES || '')
   .split(',').map((s) => s.trim().replace(/^@/, '').toLowerCase()).filter(Boolean);
+/* username в Telegram можно сменить/освободить (и его займёт чужой) — надёжнее числовые id.
+   ADMIN_USERNAMES — бутстрап; как узнали свои id (бот подскажет в /start) — переносим в ADMIN_IDS. */
+const ADMIN_IDS = (process.env.ADMIN_IDS || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 const PORT = Number(process.env.PORT || process.env.SERVER_PORT || 8080);
 const WEBAPP_URL = process.env.WEBAPP_URL || '';
 const DEV_MODE = process.env.DEV_MODE === '1';
@@ -33,19 +37,48 @@ const AUTH_TTL_SEC = 24 * 3600;
 const MAX_MINUTES = 30 * 24 * 60;
 const MAX_BET = 1e9;
 const MAX_OUTCOMES = 12;
+const MAX_ACTIVE_PER_USER = 30;
+const CREATE_COOLDOWN_MS = 10 * 1000;
+const PRUNE_SETTLED_AFTER_MS = 30 * 24 * 3600 * 1000;
+const STATE_EVENTS_LIMIT = 100;
 
 /* ---------- хранилище ---------- */
 let db = { users: {}, events: [], treasury: 0, nextId: 1 };
-try {
-  db = Object.assign(db, JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')));
-  console.log(`[db] загружено: юзеров ${Object.keys(db.users).length}, пари ${db.events.length}`);
-} catch { console.log('[db] стартуем с пустого состояния'); }
+(function load() {
+  let loaded = null;
+  try {
+    loaded = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  } catch {
+    if (fs.existsSync(DATA_FILE)) {
+      /* битый файл НЕ перезаписываем молча — откладываем и пробуем .bak */
+      const quarantine = DATA_FILE + '.corrupt-' + Date.now();
+      try { fs.renameSync(DATA_FILE, quarantine); console.error('[db] data.json битый — отложен в ' + quarantine); } catch (e) { console.error('[db] не смог отложить битый файл:', e.message); }
+      try { loaded = JSON.parse(fs.readFileSync(DATA_FILE + '.bak', 'utf8')); console.error('[db] восстановлено из .bak'); } catch { /* нет бэкапа */ }
+    }
+  }
+  if (loaded) {
+    db = Object.assign(db, loaded);
+    console.log(`[db] загружено: юзеров ${Object.keys(db.users).length}, пари ${db.events.length}`);
+  } else {
+    console.log('[db] стартуем с пустого состояния');
+  }
+})();
 
 function save() {
-  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-  const tmp = DATA_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(db));
-  fs.renameSync(tmp, DATA_FILE);
+  /* Память — источник истины; сбой диска логируем, но запрос не роняем.
+     fsync до rename — иначе после power-loss можно получить пустой data.json. */
+  try {
+    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+    const tmp = DATA_FILE + '.tmp';
+    const fd = fs.openSync(tmp, 'w');
+    fs.writeSync(fd, JSON.stringify(db));
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    try { fs.renameSync(DATA_FILE, DATA_FILE + '.bak'); } catch { /* первой записи файла ещё нет */ }
+    fs.renameSync(tmp, DATA_FILE);
+  } catch (e) {
+    console.error('[db] save не удался (память актуальна, диск отстаёт):', e.message);
+  }
 }
 
 /* ---------- игровая математика (1-в-1 с прототипом totalizator.html) ---------- */
@@ -135,7 +168,7 @@ app.use('/api', (req, res, next) => {
     u.username = username;
     save();
   }
-  u.isAdmin = ADMIN_USERNAMES.includes(username);
+  u.isAdmin = ADMIN_IDS.includes(id) || ADMIN_USERNAMES.includes(username);
   req.user = u;
   next();
 });
@@ -169,11 +202,13 @@ function stateFor(u) {
   return {
     serverNow: Date.now(),
     me: { id: u.id, name: u.name, balance: u.balance, isAdmin: !!u.isAdmin },
-    events: db.events.map((ev) => evToJson(ev, u)),
+    events: db.events.slice(0, STATE_EVENTS_LIMIT).map((ev) => evToJson(ev, u)),
   };
 }
 
 app.get('/api/state', (req, res) => res.json(stateFor(req.user)));
+
+const lastCreateAt = new Map(); // userId -> ts, простой анти-флуд на создание
 
 app.post('/api/events', (req, res) => {
   const body = req.body || {};
@@ -198,6 +233,16 @@ app.post('/api/events', (req, res) => {
   if (betMinutes > eventMinutes) return bad(res, 'Время ставок не может быть больше длительности события');
 
   const now = Date.now();
+  if (now - (lastCreateAt.get(req.user.id) || 0) < CREATE_COOLDOWN_MS) {
+    return bad(res, 'Слишком часто — подожди несколько секунд');
+  }
+  if (db.events.filter((e) => !e.settled && e.creatorId === req.user.id).length >= MAX_ACTIVE_PER_USER) {
+    return bad(res, 'У тебя слишком много активных пари — заверши старые');
+  }
+  /* старые завершённые пари выкидываем, иначе массив растёт вечно */
+  const cutoff = now - PRUNE_SETTLED_AFTER_MS;
+  db.events = db.events.filter((e) => !e.settled || (e.settledAt || e.eventEndsAt) >= cutoff);
+  lastCreateAt.set(req.user.id, now);
   db.events.unshift({
     id: db.nextId++,
     title,
@@ -246,24 +291,28 @@ app.post('/api/events/:id/settle', (req, res) => {
   if (!Number.isInteger(idx) || idx < 0 || idx >= ev.outcomes.length) return bad(res, 'Некорректный исход');
 
   const p = pools(ev);
+  const winBets = ev.bets.filter((b) => b.outcome === idx);
+  /* Выплаты не могут превысить банк пари: иначе соло-ставка с гарантированным
+     коэфом 1.5 + самообъявление результата = печать ТК из воздуха. Если
+     зафиксированные коэфы дают больше банка — делим банк пропорционально. */
+  const raws = winBets.map((b) => Math.round(b.amount * b.coef));
+  const rawTotal = raws.reduce((s, w) => s + w, 0);
   let paid = 0;
-  let winners = 0;
-  for (const b of ev.bets) {
-    if (b.outcome !== idx) continue;
-    const w = Math.round(b.amount * b.coef);
+  winBets.forEach((b, i) => {
+    const w = rawTotal > p.total ? Math.floor(raws[i] * p.total / rawTotal) : raws[i];
     const bu = db.users[b.userId];
     if (bu) bu.balance += w;
     b.payout = w;
     paid += w;
-    winners++;
-  }
-  /* остаток банка (или недостача из-за фиксированных коэфов) — в банк приложения */
+  });
+  /* остаток банка (в т.ч. крохи округления) — в банк приложения; в минус не уходит */
   db.treasury += p.total - paid;
   ev.settled = true;
   ev.result = idx;
   ev.paidTotal = paid;
-  ev.winnersCount = winners;
+  ev.winnersCount = winBets.length;
   ev.settledBy = u.id;
+  ev.settledAt = Date.now();
   save();
   res.json({ state: stateFor(u) });
 });
@@ -274,6 +323,11 @@ app.post('/api/events/:id/cancel', (req, res) => {
   if (ev.settled) return bad(res, 'Пари уже завершено');
   const u = req.user;
   if (ev.creatorId !== u.id && !u.isAdmin) return bad(res, 'Отменить пари может создатель или админ', 403);
+  /* создателю нельзя отменять после закрытия ставок: в фазе await исход уже
+     известен, и отмена — способ аннулировать свой проигрыш. Админ-арбитр может всегда. */
+  if (!u.isAdmin && phase(ev) !== 'open') {
+    return bad(res, 'Ставки уже закрыты — теперь отменить пари может только админ');
+  }
   for (const b of ev.bets) {
     const bu = db.users[b.userId];
     if (bu) bu.balance += b.amount;
@@ -282,6 +336,7 @@ app.post('/api/events/:id/cancel', (req, res) => {
   ev.cancelled = true;
   ev.result = null;
   ev.settledBy = u.id;
+  ev.settledAt = Date.now();
   save();
   res.json({ state: stateFor(u) });
 });
@@ -296,11 +351,13 @@ app.use((err, _req, res, _next) => {
 });
 
 /* ---------- телеграм-бот: long polling, без библиотек ---------- */
-async function tgApi(method, body) {
+async function tgApi(method, body, timeoutMs) {
+  /* без таймаута молча оборванный long-poll висит до дефолтных 300с undici */
   const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body || {}),
+    signal: AbortSignal.timeout(timeoutMs || 15000),
   });
   return r.json();
 }
@@ -316,9 +373,14 @@ async function handleUpdate(upd) {
   const kb = WEBAPP_URL.startsWith('https://')
     ? { inline_keyboard: [[{ text: '🎲 Открыть Тотализатор', web_app: { url: WEBAPP_URL } }]] }
     : undefined;
+  /* админу (по username) подсказываем его числовой id — чтобы переехать на ADMIN_IDS */
+  const uname = ((msg.from && msg.from.username) || '').toLowerCase();
+  const adminHint = ADMIN_USERNAMES.includes(uname)
+    ? `\n\nТы админ. Твой Telegram ID: ${msg.from.id} — впиши его в ADMIN_IDS в .env (username можно увести, id — нет).`
+    : '';
   await tgApi('sendMessage', {
     chat_id: msg.chat.id,
-    text: WELCOME + (kb ? '' : '\n\n(Мини-аппка ещё не подключена — скоро.)'),
+    text: WELCOME + (kb ? '' : '\n\n(Мини-аппка ещё не подключена — скоро.)') + adminHint,
     reply_markup: kb,
   });
 }
@@ -327,7 +389,7 @@ async function botLoop() {
   let offset = 0;
   for (;;) {
     try {
-      const res = await tgApi('getUpdates', { offset, timeout: 30, allowed_updates: ['message'] });
+      const res = await tgApi('getUpdates', { offset, timeout: 30, allowed_updates: ['message'] }, 50000);
       if (!res.ok) { await new Promise((r) => setTimeout(r, 5000)); continue; }
       for (const upd of res.result) {
         offset = upd.update_id + 1;
@@ -344,7 +406,16 @@ async function startBot() {
   if (!BOT_TOKEN) { console.log('[bot] BOT_TOKEN не задан — бот выключен'); return; }
   try {
     const me = await tgApi('getMe');
-    if (!me.ok) { console.error('[bot] токен не принят:', JSON.stringify(me)); return; }
+    if (!me.ok) {
+      /* насовсем сдаёмся только на плохом токене; 429/5xx от Telegram — транзиент, ретраим */
+      if (me.error_code === 401 || me.error_code === 404) {
+        console.error('[bot] токен не принят:', JSON.stringify(me));
+        return;
+      }
+      console.error('[bot] getMe не ok, повтор через 10с:', JSON.stringify(me));
+      setTimeout(startBot, 10000);
+      return;
+    }
     console.log(`[bot] запущен как @${me.result.username}`);
     await tgApi('deleteWebhook', {});
     if (WEBAPP_URL.startsWith('https://')) {

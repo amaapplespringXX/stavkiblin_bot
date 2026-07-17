@@ -59,10 +59,12 @@ async function main() {
   if (!up) { console.log('FAIL сервер не поднялся на ' + BASE); process.exit(1); }
 
   const sfx = String(Date.now() % 100000);
-  const U1 = 'e2e-Ася-' + sfx, U2 = 'e2e-Боря-' + sfx, ADM = 'AppleSpring';
+  const U1 = 'e2e-Ася-' + sfx, U2 = 'e2e-Боря-' + sfx, U3 = 'e2e-Женя-' + sfx, ADM = 'AppleSpring';
 
   let r = await get('/api/state', { user: U1 });
   ok(r.status === 200 && r.data.me.balance === 10000, 'новый юзер получает 10000 ТК', r.data && r.data.me);
+  /* серверные timestamps сравниваем с серверными часами, не с локальными */
+  const clockOffset = r.data.serverNow - Date.now();
 
   r = await get('/api/state', {});
   ok(r.status === 401, 'без авторизации — 401', r.status);
@@ -76,6 +78,9 @@ async function main() {
   const ev1 = r.data.state.events.find((e) => e.title.indexOf('E2E: сколько') === 0);
   ok(!!ev1 && ev1.outcomes.length === 2 && ev1.outcomes[0].coef === 1.5, 'стартовый коэф 1.5 у пустого пари', ev1 && ev1.outcomes);
 
+  r = await post('/api/events', { title: 'E2E: кулдаун', outcomes: ['а', 'б'], betMinutes: 1, eventMinutes: 1 }, { user: U1 });
+  ok(r.status === 400, 'кулдаун на создание пари работает', r.data);
+
   r = await post('/api/events', { title: '', outcomes: ['а', 'б'], betMinutes: 1, eventMinutes: 1 }, { user: U1 });
   ok(r.status === 400, 'пустой title отклонён');
   r = await post('/api/events', { title: 'x', outcomes: ['а'], betMinutes: 1, eventMinutes: 1 }, { user: U1 });
@@ -88,6 +93,13 @@ async function main() {
   r = await post('/api/events', { title: 'E2E: отмена ' + sfx, outcomes: ['да', 'нет'], betMinutes: 1, eventMinutes: 1 }, { user: U2 });
   const ev2 = r.data.state.events.find((e) => e.title === 'E2E: отмена ' + sfx);
   ok(!!ev2, 'второе пари создано');
+
+  /* пари для проверки анти-станка: соло-ставка + самообъявление результата */
+  r = await post('/api/events', { title: 'E2E: станок ' + sfx, outcomes: ['иксы', 'игреки'], betMinutes: 1, eventMinutes: 1 }, { user: U3 });
+  const ev3 = r.data.state.events.find((e) => e.title === 'E2E: станок ' + sfx);
+  ok(!!ev3, 'третье пари создано');
+  r = await post('/api/events/' + ev3.id + '/bets', { outcome: 0, amount: 1000 }, { user: U3 });
+  ok(r.status === 200 && r.data.coef === 1.5 && r.data.state.me.balance === 9000, 'соло-ставка принята с коэфом 1.5', r.data && r.data.coef);
 
   // --- ставки ---
   r = await post('/api/events/' + ev1.id + '/bets', { outcome: 0, amount: 1000 }, { user: U1 });
@@ -122,8 +134,8 @@ async function main() {
     console.log('SKIP initData-тесты: нет BOT_TOKEN');
   }
 
-  // --- ждём конца события ---
-  const waitMs = ev1.eventEndsAt - Date.now() + 2000;
+  // --- ждём конца события (по серверным часам) ---
+  const waitMs = ev1.eventEndsAt - (Date.now() + clockOffset) + 2000;
   console.log('...ждём окончания события ~' + Math.max(0, Math.ceil(waitMs / 1000)) + 'с');
   if (waitMs > 0) await sleep(waitMs);
 
@@ -144,6 +156,13 @@ async function main() {
   r = await post('/api/events/' + ev1.id + '/settle', { outcome: 0 }, { user: U1 });
   ok(r.status === 400, 'повторный settle отклонён');
 
+  // --- анти-станок: выплата не может превысить банк пари ---
+  r = await post('/api/events/' + ev3.id + '/settle', { outcome: 0 }, { user: U3 });
+  ok(r.status === 200, 'соло-создатель объявил свой результат', r.data);
+  ok(r.data.state.me.balance === 10000, 'выплата обрезана банком: 1000 назад, не 1500 (ТК из воздуха нет)', r.data.state.me.balance);
+  const ev3after = r.data.state.events.find((e) => e.id === ev3.id);
+  ok(ev3after.myBets[0].payout === 1000, 'payout соло-ставки = банк (1000)', ev3after && ev3after.myBets);
+
   // --- отмена ---
   let s1 = await get('/api/state', { user: U1 });
   const balBefore = s1.data.me.balance; // 10000 - 1000(ev1, проиграла) - 700(ev2) = 8300
@@ -151,6 +170,8 @@ async function main() {
 
   r = await post('/api/events/' + ev2.id + '/cancel', {}, { user: U1 });
   ok(r.status === 403, 'чужой не может отменить пари', r.status);
+  r = await post('/api/events/' + ev2.id + '/cancel', {}, { user: U2 });
+  ok(r.status === 400, 'создатель не может отменить после закрытия ставок (гашение проигрыша)', r.status);
   r = await post('/api/events/' + ev2.id + '/cancel', {}, { user: ADM });
   ok(r.status === 200, 'админ отменил пари', r.data);
   s1 = await get('/api/state', { user: U1 });

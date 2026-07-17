@@ -7,6 +7,8 @@ var devUser = null;
 
 var state = null;        // последний ответ /api/state
 var lastJson = '';       // для сравнения «изменилось ли» (чтобы не дёргать DOM зря)
+var lastServerNow = 0;   // защита от устаревшего ответа поллинга поверх свежего POST
+var inflight = false;    // guard от дабл-тапа по кнопкам действий
 var timeOffset = 0;      // serverNow - Date.now()
 var ui = {};             // черновики форм ставок: {evId: {sel, amount}}
 var confirmPick = {};    // выбранный исход при объявлении результата: {evId: idx}
@@ -68,6 +70,9 @@ async function api(path,body){
 }
 function stableJson(s){return JSON.stringify({me:s.me,events:s.events});}
 function applyState(s){
+  if(!IN_TG&&!devUser)return;            // ответ долетел после logout — не воскрешаем UI
+  if(s.serverNow<lastServerNow)return;   // устаревший снапшот (гонка поллинга и POST)
+  lastServerNow=s.serverNow;
   state=s;
   timeOffset=s.serverNow-Date.now();
   lastJson=stableJson(s);
@@ -76,9 +81,10 @@ function applyState(s){
 async function refreshQuiet(){
   try{
     var s=await api('/state');
+    if(s.serverNow<lastServerNow)return;
     timeOffset=s.serverNow-Date.now();
     if(stableJson(s)!==lastJson)applyState(s);
-    else state=s;
+    else{state=s;lastServerNow=s.serverNow;}
   }catch(e){/* тихо: следующий поллинг попробует снова */}
 }
 
@@ -106,8 +112,12 @@ async function start(){
     applyState(await api('/state'));
   }catch(e){
     if(IN_TG){
+      /* холодный старт Render-прокси занимает десятки секунд — ретраим сами,
+         иначе аппка остаётся мёртвой до ручного перезапуска */
       document.getElementById('view-app').style.display='block';
-      document.getElementById('events').innerHTML='<div class="empty">'+esc(e.message)+'</div>';
+      document.getElementById('events').innerHTML=
+        '<div class="empty">'+esc(e.message)+'<br>Переподключаюсь…</div>';
+      setTimeout(start,3000);
     }else{
       devUser=null;
       try{localStorage.removeItem('tk-dev-user');}catch(err){}
@@ -142,11 +152,13 @@ function addOutcomeField(){
   box.appendChild(row);
 }
 async function submitEvent(){
+  if(inflight)return;
   var title=document.getElementById('cf-title').value.trim();
   var outcomes=[].slice.call(document.querySelectorAll('#cf-outcomes input'))
     .map(function(i){return i.value.trim();}).filter(function(v){return v;});
   var betMin=parseInt(document.getElementById('cf-betmin').value,10);
   var evMin=parseInt(document.getElementById('cf-evmin').value,10);
+  inflight=true;
   try{
     var res=await api('/events',{title:title,outcomes:outcomes,betMinutes:betMin,eventMinutes:evMin});
     document.getElementById('cf-title').value='';
@@ -155,6 +167,7 @@ async function submitEvent(){
     toast('Пари создано');
     applyState(res.state);
   }catch(e){toast(e.message);}
+  finally{inflight=false;}
 }
 
 /* ---------- ставки ---------- */
@@ -168,51 +181,65 @@ function onAmountInput(evId,val){
   ui[evId].amount=val;
   updatePreview(evId);
 }
+/* parseInt молча превращает «1e3» в 1, «500.9» в 500 — парсим строго */
+function parseAmount(val){
+  var n=Number(val);
+  return Number.isInteger(n)&&n>0?n:null;
+}
 function updatePreview(evId){
   var ev=findEv(evId);
   var d=ui[evId]||{};
   var el=document.getElementById('preview-'+evId);
   if(!el||!ev)return;
-  var amount=parseInt(d.amount,10);
-  if(d.sel==null||!(amount>0)){el.textContent='';return;}
+  var amount=parseAmount(d.amount);
+  if(d.sel==null||amount==null){el.textContent='';return;}
   var k=coefPreview(ev,d.sel,amount);
   el.innerHTML='Твой коэффициент: <b>'+k.toFixed(2)+'</b> · возможный выигрыш: <b>'+fmt(amount*k)+' ТК</b>';
 }
 async function placeBet(evId){
+  if(inflight)return;
   var d=ui[evId]||{};
-  var amount=parseInt(d.amount,10);
+  var amount=parseAmount(d.amount);
   if(d.sel==null){toast('Выбери исход');return;}
-  if(!(amount>0)){toast('Введи сумму ставки');return;}
+  if(amount==null){toast('Введи целую сумму ставки');return;}
+  inflight=true;
   try{
     var res=await api('/events/'+evId+'/bets',{outcome:d.sel,amount:amount});
     ui[evId]={};
     toast('Ставка принята: '+fmt(amount)+' ТК, коэффициент '+res.coef.toFixed(2));
     applyState(res.state);
   }catch(e){toast(e.message);refreshQuiet();}
+  finally{inflight=false;}
 }
 
 /* ---------- результат и отмена ---------- */
 function pickResult(evId,idx){confirmPick[evId]=idx;render();}
 function cancelResult(evId){delete confirmPick[evId];render();}
 async function confirmResult(evId){
+  if(inflight)return;
   var idx=confirmPick[evId];
   if(idx==null)return;
+  inflight=true;
   try{
     var res=await api('/events/'+evId+'/settle',{outcome:idx});
     delete confirmPick[evId];
     toast('Результат объявлен');
     applyState(res.state);
   }catch(e){toast(e.message);refreshQuiet();}
+  finally{inflight=false;}
 }
 function askCancelEvent(evId){cancelPick[evId]=true;render();}
 function undoCancelPick(evId){delete cancelPick[evId];render();}
 async function doCancelEvent(evId){
+  if(inflight)return;
+  inflight=true;
   try{
     var res=await api('/events/'+evId+'/cancel');
     delete cancelPick[evId];
     toast('Пари отменено, ставки возвращены');
     applyState(res.state);
   }catch(e){toast(e.message);refreshQuiet();}
+  finally{inflight=false;}
 }
 
 /* ---------- рендер ---------- */
@@ -225,6 +252,11 @@ function render(){
   document.getElementById('btn-logout').style.display=IN_TG?'none':'';
 
   var box=document.getElementById('events');
+  /* innerHTML-пересборка убивает фокус активного инпута (на мобиле сворачивается
+     клавиатура) — запоминаем и возвращаем */
+  var focusId=null;
+  var ae=document.activeElement;
+  if(ae&&ae.id&&ae.id.indexOf('amount-')===0&&box.contains(ae))focusId=ae.id;
   box.innerHTML=state.events.length
     ? state.events.map(renderEvent).join('')
     : '<div class="empty">Пока нет ни одного пари. Создай первое!</div>';
@@ -237,6 +269,10 @@ function render(){
     if(inp&&d&&d.amount!=null)inp.value=d.amount;
     updatePreview(ev.id);
   });
+  if(focusId){
+    var el2=document.getElementById(focusId);
+    if(el2){try{el2.focus();}catch(e){}}
+  }
   updateCountdowns();
 }
 
@@ -322,8 +358,9 @@ function renderEvent(ev){
       '</p></div>';
   }
 
-  /* отмена пари (создатель или админ, пока не завершено) */
-  if(!ev.settled&&canManage){
+  /* отмена пари: создатель — только пока открыты ставки, админ — всегда (до завершения) */
+  var canCancel=!ev.settled&&(me.isAdmin||(ev.creatorId===me.id&&ph==='open'));
+  if(canCancel){
     if(cancelPick[ev.id]){
       h+='<div class="confirmbar">Отменить пари и вернуть все ставки?'+
          '<button class="danger" onclick="doCancelEvent('+ev.id+')">Да, отменить</button>'+
