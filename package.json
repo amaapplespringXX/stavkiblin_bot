@@ -1,0 +1,17 @@
+{
+  "name": "totalizator-miniapp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Тотализатор — Telegram Mini App на Толикоинах",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "e2e": "node scripts/e2e.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

@@ -1,0 +1,61 @@
+# Тотализатор — Telegram Mini App
+
+Дружеские пари на Толикоины (ТК) для [@stavkiblin_bot](https://t.me/stavkiblin_bot).
+Один Node-процесс: Express (API + статика миниаппы) + телеграм-бот на long polling.
+Состояние — в памяти, атомарно сбрасывается в `data/data.json`. Без БД и нативных зависимостей.
+
+## Правила игры
+
+- Новый игрок получает **10 000 ТК**.
+- Любой может создать пари: вопрос, 2+ исходов, время приёма ставок и длительность события.
+- Коэффициент **фиксируется в момент ставки**: `K = (общий банк + ставка) / (банк исхода + ставка)`, минимум 1.5 на первую ставку.
+- Фазы: ставки открыты → ставки закрыты (событие идёт) → ожидает результата → завершено.
+- Результат объявляет **создатель пари или админ**. Выигравшим — `ставка × коэф`, остаток банка уходит в казну приложения.
+- Создатель/админ может **отменить** пари — все ставки возвращаются.
+
+## Локальный запуск
+
+```bash
+npm install
+cp .env.example .env   # вписать BOT_TOKEN
+npm start              # http://localhost:8080
+npm run e2e            # e2e-прогон (~70 сек, нужен запущенный сервер и DEV_MODE=1)
+```
+
+`DEV_MODE=1` разрешает вход по имени из браузера (заголовок `X-Dev-User`) — только для отладки, на проде держать `0`.
+
+## Деплой (проверенная схема: wispbyte + Render-прокси + DuckDNS)
+
+Telegram открывает миниаппы только по **HTTPS**, а wispbyte free даёт только HTTP на
+нестандартном порту. Поэтому:
+
+```
+Telegram Menu Button
+   ↓
+https://<app>.onrender.com          ← HTTPS-фронт, Render free tier (proxy/server.js)
+   ↓ прозрачный прокси
+http://stavkiblin.duckdns.org:<порт> ← бэк на wispbyte free (этот server.js)
+```
+
+`*.onrender.com` не в блок-листах AdGuard/anti-phishing (в отличие от `*.workers.dev` —
+проверено на прошлой миниаппке).
+
+1. **wispbyte**: Node.js-сервер (Node 18+), `git clone` этого репо, `AUTO_UPDATE=1`
+   (рестарт контейнера = `git pull` + `npm install` + start). Порт панель выдаёт сама
+   как `SERVER_PORT` — сервер его читает. `.env` на сервере: `BOT_TOKEN`,
+   `ADMIN_USERNAMES`, `DEV_MODE=0`, `WEBAPP_URL=https://<app>.onrender.com`.
+2. **DuckDNS**: поддомен `stavkiblin` → A-запись на IP wispbyte-ноды
+   (не привязываемся к автогенерённому хостнейму wispbyte — он может меняться).
+3. **Render**: New Web Service из этого же репо, Start Command `node proxy/server.js`,
+   env `BACKEND_URL=http://stavkiblin.duckdns.org:<порт>`.
+4. Кнопку меню бот ставит сам при старте из `WEBAPP_URL`.
+5. Render free засыпает после 15 мин простоя — бэк сам пингует
+   `WEBAPP_URL/proxy-health` каждые 14 минут (см. конец server.js).
+
+**Деплой обновлений:** `git push` → Stop/Start контейнера на wispbyte.
+
+**Известный глюк free-нод wispbyte:** контейнер живой, слушает порт, TCP-connect
+проходит, но HTTP-ответа снаружи нет — сломан port-forward ноды. Лечится
+**Stop → Start** (не Restart), потом проверить `http://<sub>.duckdns.org:<порт>/health`.
+
+Важно: одновременно два инстанса бота (локальный + серверный) запускать нельзя — long polling конфликтует.
