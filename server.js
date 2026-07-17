@@ -9,14 +9,22 @@ const https = require('https');
 const crypto = require('crypto');
 const express = require('express');
 
-/* ---------- .env (без зависимостей) ---------- */
+/* ---------- env-файл (без зависимостей) ----------
+   Читаем первый существующий из кандидатов. config.env — для панелей вроде
+   wispbyte/Pterodactyl, которые не дают создать файл с точкой в начале имени. */
 (function loadEnv() {
-  try {
-    for (const line of fs.readFileSync(path.join(__dirname, '.env'), 'utf8').split(/\r?\n/)) {
+  const candidates = [process.env.ENV_FILE, '.env', 'config.env', 'env.txt'].filter(Boolean);
+  for (const name of candidates) {
+    const file = path.isAbsolute(name) ? name : path.join(__dirname, name);
+    let text;
+    try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    for (const line of text.split(/\r?\n/)) {
       const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
       if (m && !(m[1] in process.env)) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
     }
-  } catch { /* .env нет — берём переменные окружения как есть */ }
+    console.log('[env] загружен ' + name);
+    break;
+  }
 })();
 
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
